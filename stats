@@ -1,0 +1,98 @@
+#!/usr/bin/env ruby
+
+require "csv"
+require "octokit"
+
+if ARGV.length < 2
+  puts "USAGE: ./stats TOKEN ORG..."
+  exit 64
+end
+
+CUTOFF = Time.now - (60 * 60 * 24 * 31) # 1 month ago
+
+PR = Struct.new(:author, :reviews)
+UserStats = Struct.new(:opened, :reviewed, :distinct_reviewed)
+
+$client = Octokit::Client.new(
+  access_token: ARGV.shift,
+  default_media_type: "application/vnd.github.black-cat-preview+json",
+)
+
+$repos = Hash.new { |_, _| [] } # repo -> [prs]
+
+def process_org(org)
+  repos = $client.org_repos(org, auto_paginate: true)
+  repos.each do |repo|
+    process_repo(repo)
+  end
+end
+
+def process_repo(repo)
+  if $client.rate_limit.remaining < 500
+    nap = 1 + $client.rate_limit.resets_in
+    $stderr.puts "\nratelimit running low: sleeping for #{nap} seconds"
+    sleep nap
+  end
+
+  prs = relevant_prs(repo).map do |pr|
+    begin
+      reviews = $client.get("/repos/#{repo.full_name}/pulls/#{pr.number}/reviews", per_page: 100).map do |r|
+        r.user.login
+      end
+      $stderr << "." # indicate progress
+      PR.new(pr.user.login, reviews)
+    rescue => ex
+      $stderr.puts "\nfailure getting reviews for #{repo.full_name}##{pr.number}:"
+      $stderr.puts "octokit: #{$client.last_response.inspect} #{$client.last_response.headers}"
+      $stderr.puts "ex: #{ex.message}"
+      nil
+    end
+  end.compact
+  $repos[repo.full_name] = prs
+
+  $stderr << "." # indicate progress
+end
+
+def relevant_prs(repo)
+  prs = $client.pulls(repo.full_name, state: "closed", per_page: 100)
+  rels = $client.last_response.rels
+  while rels[:next] && prs[-1].created_at > CUTOFF
+    #$stderr.puts "\nDEBUG: getting more PRs for #{repo.full_name}: #{prs.count} | #{prs[-1].created_at} | #{CUTOFF} "
+    prs.concat $client.get(rels[:next].href)
+    rels = $client.last_response.rels
+    $stderr << "." # indicate progress
+  end
+  prs.select { |pr| pr.created_at > CUTOFF }
+end
+
+def calc_user_stats
+  stats = Hash.new { |_, _| UserStats.new(0, 0, 0) }
+  $repos.each do |repo, prs|
+    prs.each do |pr|
+      stats[pr.author] = stats[pr.author].tap { |s| s.opened += 1 }
+      pr.reviews.each do |review_author|
+        stats[pr.author] = stats[pr.author].tap { |s| s.reviewed += 1 }
+      end
+      pr.reviews.uniq.each do |review_author|
+        stats[pr.author] = stats[pr.author].tap { |s| s.distinct_reviewed += 1 }
+      end
+    end
+  end
+  stats
+end
+
+ARGV.each do |org|
+  $stderr.puts "\nProcessing #{org} org"
+  process_org(org)
+end
+
+pr_count = $repos.inject(0) { |memo, key| memo + $repos[key].count }
+review_count = $repos.inject(0) { |memo, key| memo + $repos[key].map(&:reviews).map(&:count).sum }
+$stderr.puts "\n\nStats for #{$repos.keys.count} repos, #{pr_count} PRs, #{review_count} reviews"
+
+user_stats = calc_user_stats
+
+puts "Author, Prs Opened, Reviews written, Distinct PRs reviewed"
+user_stats.each do |name, stat|
+  puts "#{name}, #{stat.opened}, #{stat.reviewed}, #{stat.distinct_reviewed}"
+end
